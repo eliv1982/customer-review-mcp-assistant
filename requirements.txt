@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-pydantic
-python-dotenv
-aiogram
-openai
-requests
+# Python 3.10+ is required (the code uses `X | None` annotations).
+# Bounds are made only where they protect compatibility; transitive packages are not pinned.
+aiogram>=3,<4        # aiogram 3 Dispatcher/filters API; tested 3.28.2
+fastapi>=0.100,<1    # 0.100 is the first release with pydantic v2 support; tested 0.136.3
+openai>=1.55.3,<3    # OpenAI() client + chat.completions API; 1.55.3 is the first 1.x that works with httpx>=0.28; tested 1.109.1 and 2.40.0
+pydantic>=2,<3       # tested 2.13.4
+python-dotenv        # load_dotenv(path) only; tested 1.2.2
+requests             # requests.post + exceptions only; tested 2.34.2
+uvicorn              # uvicorn.run(app, host, port) only; tested 0.48.0

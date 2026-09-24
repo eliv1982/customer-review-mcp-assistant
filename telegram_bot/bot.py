@@ -1,6 +1,7 @@
 """Telegram bot for customer review assistant."""
 
 import asyncio
+import html
 import logging
 
 from aiogram import Bot, Dispatcher, F
@@ -9,7 +10,7 @@ from aiogram.types import Message
 
 from config import TELEGRAM_BOT_TOKEN
 from llm_router import route_user_message
-from mcp_client import MCPClientError, call_tool
+from mcp_client import MCPConnectionError, MCPToolError, call_tool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,19 +27,30 @@ START_TEXT = (
 )
 
 
+MAX_ERROR_LEN = 300
+
+
+def _esc(value) -> str:
+    """Escape a dynamic value for Telegram's HTML parse mode.
+
+    Telegram only requires &, < and > to be escaped in text, so quotes stay as is.
+    """
+    return html.escape(str(value), quote=False)
+
+
 def _stars(rating: int) -> str:
     return "⭐" * rating + "☆" * (5 - rating)
 
 
 def _format_review(review: dict) -> str:
     return (
-        f"🆔 <b>ID:</b> {review['id']}\n"
-        f"👤 <b>Клиент:</b> {review['customer_name']}\n"
-        f"📍 <b>Источник:</b> {review['source']}\n"
-        f"⭐ <b>Рейтинг:</b> {_stars(review['rating'])} ({review['rating']}/5)\n"
-        f"📝 <b>Текст:</b> {review['text']}\n"
-        f"📌 <b>Статус:</b> {review['status']}\n"
-        f"🕐 <b>Дата:</b> {review['created_at']}"
+        f"🆔 <b>ID:</b> {_esc(review['id'])}\n"
+        f"👤 <b>Клиент:</b> {_esc(review['customer_name'])}\n"
+        f"📍 <b>Источник:</b> {_esc(review['source'])}\n"
+        f"⭐ <b>Рейтинг:</b> {_stars(review['rating'])} ({_esc(review['rating'])}/5)\n"
+        f"📝 <b>Текст:</b> {_esc(review['text'])}\n"
+        f"📌 <b>Статус:</b> {_esc(review['status'])}\n"
+        f"🕐 <b>Дата:</b> {_esc(review['created_at'])}"
     )
 
 
@@ -53,18 +65,18 @@ def _format_reviews_list(reviews: list) -> str:
 
 def _format_stats(stats: dict) -> str:
     by_source = "\n".join(
-        f"  • {src}: {cnt}" for src, cnt in stats.get("by_source", {}).items()
+        f"  • {_esc(src)}: {_esc(cnt)}" for src, cnt in stats.get("by_source", {}).items()
     )
     by_status = "\n".join(
-        f"  • {st}: {cnt}" for st, cnt in stats.get("by_status", {}).items()
+        f"  • {_esc(st)}: {_esc(cnt)}" for st, cnt in stats.get("by_status", {}).items()
     )
     return (
         "📊 <b>Статистика отзывов</b>\n\n"
-        f"📦 <b>Всего отзывов:</b> {stats['total_reviews']}\n"
-        f"⭐ <b>Средний рейтинг:</b> {stats['average_rating']}\n\n"
-        f"😊 <b>Положительные (4-5):</b> {stats['positive_count']}\n"
-        f"😐 <b>Нейтральные (3):</b> {stats['neutral_count']}\n"
-        f"😞 <b>Негативные (1-2):</b> {stats['negative_count']}\n\n"
+        f"📦 <b>Всего отзывов:</b> {_esc(stats['total_reviews'])}\n"
+        f"⭐ <b>Средний рейтинг:</b> {_esc(stats['average_rating'])}\n\n"
+        f"😊 <b>Положительные (4-5):</b> {_esc(stats['positive_count'])}\n"
+        f"😐 <b>Нейтральные (3):</b> {_esc(stats['neutral_count'])}\n"
+        f"😞 <b>Негативные (1-2):</b> {_esc(stats['negative_count'])}\n\n"
         f"<b>По источникам:</b>\n{by_source or '  —'}\n\n"
         f"<b>По статусам:</b>\n{by_status or '  —'}"
     )
@@ -76,14 +88,14 @@ def _format_draft_reply(data: dict) -> str:
     return (
         "✉️ <b>Черновик ответа</b>\n\n"
         f"<b>Исходный отзыв:</b>\n{_format_review(review)}\n\n"
-        f"<b>Черновик ответа:</b>\n{draft}"
+        f"<b>Черновик ответа:</b>\n{_esc(draft)}"
     )
 
 
 def _format_calculate(data: dict) -> str:
     if "error" in data:
-        return f"❌ {data['error']}"
-    return f"🧮 <b>{data['expression']}</b> = <b>{data['result']}</b>"
+        return f"❌ {_esc(data['error'])}"
+    return f"🧮 <b>{_esc(data['expression'])}</b> = <b>{_esc(data['result'])}</b>"
 
 
 def format_tool_result(tool_name: str, result) -> str:
@@ -97,7 +109,7 @@ def format_tool_result(tool_name: str, result) -> str:
         return "✅ <b>Отзыв добавлен!</b>\n\n" + _format_review(result)
     if isinstance(result, list):
         return _format_reviews_list(result)
-    return str(result)
+    return _esc(result)
 
 
 async def cmd_start(message: Message) -> None:
@@ -125,13 +137,18 @@ async def handle_message(message: Message) -> None:
         response = call_tool(tool_name, arguments)
         formatted = format_tool_result(tool_name, response.get("result"))
         await message.answer(formatted, parse_mode="HTML")
-    except MCPClientError as e:
-        logger.exception("MCP client error")
+    except MCPConnectionError:
+        logger.exception("MCP server is unreachable")
         await message.answer(
-            f"⚠️ Не удалось связаться с сервером отзывов.\n\n"
-            f"Убедитесь, что MCP-сервер запущен:\n"
-            f"<code>cd mcp_server && python server.py</code>\n\n"
-            f"Ошибка: {e}",
+            "⚠️ Не удалось связаться с сервером отзывов.\n\n"
+            "Убедитесь, что MCP-сервер запущен:\n"
+            "<code>cd mcp_server &amp;&amp; python server.py</code>",
+            parse_mode="HTML",
+        )
+    except MCPToolError as e:
+        logger.warning("MCP tool %s failed: %s", tool_name, e)
+        await message.answer(
+            f"⚠️ Инструмент не смог выполнить запрос: {_esc(str(e)[:MAX_ERROR_LEN])}",
             parse_mode="HTML",
         )
 

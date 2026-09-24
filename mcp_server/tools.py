@@ -1,6 +1,7 @@
 """MCP-style tools for customer review management."""
 
 import ast
+import math
 import operator
 from datetime import datetime
 
@@ -17,6 +18,29 @@ _BIN_OPS = {
     ast.Pow: operator.pow,
 }
 _UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+MAX_LIMIT = 50  # upper bound for every "limit" argument
+_SQLITE_MAX_INT = 2**63 - 1  # larger ints cannot be bound as SQLite INTEGER
+
+
+class ToolError(Exception):
+    """An expected tool failure whose message is safe to show to the HTTP client.
+
+    Only this family is reported verbatim by the server; any other exception
+    (including a plain ValueError) is treated as an internal error.
+    """
+
+
+class ToolArgumentError(ToolError):
+    """Tool arguments do not match the tool's inputSchema."""
+
+
+class UnknownToolError(ToolError):
+    """The requested tool does not exist."""
+
+
+class ToolDomainError(ToolError):
+    """A well-formed call that the business rules reject (e.g. review not found)."""
 
 
 def _fetch_reviews(sql: str, params: tuple = ()) -> list[dict]:
@@ -68,7 +92,7 @@ def add_review(
     text: str,
 ) -> dict:
     if not 1 <= rating <= 5:
-        raise ValueError("Рейтинг должен быть от 1 до 5")
+        raise ToolArgumentError("Рейтинг должен быть от 1 до 5")
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
@@ -146,7 +170,7 @@ def draft_reply(review_id: int, tone: str = "neutral") -> dict:
             "SELECT * FROM reviews WHERE id = ?", (review_id,)
         ).fetchone()
         if row is None:
-            raise ValueError(f"Отзыв с id={review_id} не найден")
+            raise ToolDomainError(f"Отзыв с id={review_id} не найден")
 
         review = row_to_dict(row)
         rating = review["rating"]
@@ -175,10 +199,9 @@ def draft_reply(review_id: int, tone: str = "neutral") -> dict:
 
 
 def _safe_eval_node(node: ast.AST) -> float:
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+    # Exact type check: bool is an int subclass, but True/False are not numbers here.
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
         return float(node.value)
-    if isinstance(node, ast.Num):  # Python < 3.8 compat
-        return float(node.n)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_safe_eval_node(node.operand))
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
@@ -193,15 +216,18 @@ def _safe_eval_node(node: ast.AST) -> float:
 def calculate(expression: str) -> dict:
     try:
         tree = ast.parse(expression.strip(), mode="eval")
-        if not isinstance(tree.body, (ast.BinOp, ast.UnaryOp, ast.Constant)):
-            if not isinstance(tree.body, ast.Num):
-                raise ValueError("Недопустимое выражение")
         result = _safe_eval_node(tree.body)
+        if not math.isfinite(result):
+            raise OverflowError
         if result == int(result):
             result = int(result)
         return {"expression": expression, "result": result}
     except ZeroDivisionError:
         return {"expression": expression, "error": "Деление на ноль"}
+    except OverflowError:
+        return {"expression": expression, "error": "Результат слишком велик"}
+    except RecursionError:
+        return {"expression": expression, "error": "Выражение слишком сложное"}
     except (SyntaxError, ValueError, TypeError) as e:
         return {"expression": expression, "error": f"Ошибка вычисления: {e}"}
 
@@ -228,8 +254,11 @@ MCP_TOOLS = [
                     "type": "integer",
                     "description": "Максимальное количество отзывов",
                     "default": 10,
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
                 }
             },
+            "additionalProperties": False,
         },
     },
     {
@@ -243,9 +272,12 @@ MCP_TOOLS = [
                     "type": "integer",
                     "description": "Максимальное количество результатов",
                     "default": 10,
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
                 },
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     },
     {
@@ -254,14 +286,22 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "rating": {"type": "integer", "description": "Оценка от 1 до 5"},
+                "rating": {
+                    "type": "integer",
+                    "description": "Оценка от 1 до 5",
+                    "minimum": 1,
+                    "maximum": 5,
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Максимальное количество результатов",
                     "default": 10,
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
                 },
             },
             "required": ["rating"],
+            "additionalProperties": False,
         },
     },
     {
@@ -274,8 +314,11 @@ MCP_TOOLS = [
                     "type": "integer",
                     "description": "Максимальное количество результатов",
                     "default": 10,
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
                 }
             },
+            "additionalProperties": False,
         },
     },
     {
@@ -289,16 +332,26 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Источник: Telegram, Website, Marketplace, Google Maps",
                 },
-                "rating": {"type": "integer", "description": "Оценка от 1 до 5"},
+                "rating": {
+                    "type": "integer",
+                    "description": "Оценка от 1 до 5",
+                    "minimum": 1,
+                    "maximum": 5,
+                },
                 "text": {"type": "string", "description": "Текст отзыва"},
             },
             "required": ["customer_name", "source", "rating", "text"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "get_review_stats",
         "description": "Возвращает статистику по отзывам",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
     },
     {
         "name": "draft_reply",
@@ -306,7 +359,12 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "review_id": {"type": "integer", "description": "ID отзыва"},
+                "review_id": {
+                    "type": "integer",
+                    "description": "ID отзыва",
+                    "minimum": 1,
+                    "maximum": _SQLITE_MAX_INT,
+                },
                 "tone": {
                     "type": "string",
                     "description": "Тон ответа: neutral, warm, professional",
@@ -314,6 +372,7 @@ MCP_TOOLS = [
                 },
             },
             "required": ["review_id"],
+            "additionalProperties": False,
         },
     },
     {
@@ -328,16 +387,62 @@ MCP_TOOLS = [
                 }
             },
             "required": ["expression"],
+            "additionalProperties": False,
         },
     },
 ]
 
+_TOOL_SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in MCP_TOOLS}
+
+_TYPE_CHECKS = {
+    "string": lambda v: isinstance(v, str),
+    # bool is an int subclass in Python but not a JSON integer
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+}
+_TYPE_LABELS = {"string": "строкой", "integer": "целым числом"}
+
+
+def validate_arguments(schema: dict, arguments) -> None:
+    """Check arguments against the small JSON Schema subset used by MCP_TOOLS.
+
+    Supported: object with properties / required / additionalProperties: false;
+    property types "string" and "integer"; integer minimum / maximum.
+    """
+    if not isinstance(arguments, dict):
+        raise ToolArgumentError("Аргументы должны быть JSON-объектом")
+
+    properties = schema.get("properties", {})
+    for name in schema.get("required", []):
+        if name not in arguments:
+            raise ToolArgumentError(f"Не указан обязательный аргумент «{name}»")
+
+    for name, value in arguments.items():
+        spec = properties.get(name)
+        if spec is None:
+            if schema.get("additionalProperties", True) is False:
+                raise ToolArgumentError(f"Неизвестный аргумент «{name}»")
+            continue
+
+        expected = spec["type"]
+        if not _TYPE_CHECKS[expected](value):
+            raise ToolArgumentError(
+                f"Аргумент «{name}» должен быть {_TYPE_LABELS[expected]}"
+            )
+        if "minimum" in spec and value < spec["minimum"]:
+            raise ToolArgumentError(
+                f"Аргумент «{name}» должен быть не меньше {spec['minimum']}"
+            )
+        if "maximum" in spec and value > spec["maximum"]:
+            raise ToolArgumentError(
+                f"Аргумент «{name}» должен быть не больше {spec['maximum']}"
+            )
+
 
 def call_tool_by_name(tool_name: str, arguments: dict):
     if tool_name not in TOOL_FUNCTIONS:
-        raise ValueError(f"Неизвестный инструмент: {tool_name}")
-    func = TOOL_FUNCTIONS[tool_name]
-    return func(**arguments)
+        raise UnknownToolError(f"Неизвестный инструмент: {tool_name}")
+    validate_arguments(_TOOL_SCHEMAS[tool_name], arguments)
+    return TOOL_FUNCTIONS[tool_name](**arguments)
 
 
 # Initialize DB on import

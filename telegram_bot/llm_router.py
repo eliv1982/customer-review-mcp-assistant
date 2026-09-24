@@ -43,6 +43,7 @@ SYSTEM_PROMPT = """Ты — помощник для работы с отзыва
 "какой средний рейтинг и сколько негативных отзывов" → {"tool": "get_review_stats", "arguments": {}}
 "сколько будет 1200 * 0.15" → {"tool": "calculate", "arguments": {"expression": "1200 * 0.15"}}
 
+Ограничения аргументов: limit — целое число от 1 до 50; rating — целое число от 1 до 5.
 Не вызывай несуществующие tools. Не придумывай данные из базы."""
 
 VALID_TOOLS = {
@@ -85,15 +86,16 @@ def route_user_message(user_text: str) -> dict:
             response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content or ""
-    except OpenAIError as e:
+    except OpenAIError:
+        # Details stay in the log: SDK messages can contain API-key fragments.
         logger.exception("OpenAI API error")
         return {
             "tool": None,
-            "answer": f"Ошибка OpenAI API: {e}. Попробуйте позже.",
+            "answer": "Не удалось обратиться к OpenAI API. Попробуйте позже.",
         }
 
     parsed = _parse_json_response(content)
-    if parsed is None:
+    if not isinstance(parsed, dict):
         return {
             "tool": None,
             "answer": "Не удалось разобрать ответ. Попробуйте переформулировать запрос.",
@@ -101,21 +103,25 @@ def route_user_message(user_text: str) -> dict:
 
     tool = parsed.get("tool")
     if tool is None:
+        answer = parsed.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            answer = "Я могу помочь с отзывами: показать список, найти, добавить, статистику или черновик ответа."
+        return {"tool": None, "answer": answer}
+
+    if not isinstance(tool, str) or tool not in VALID_TOOLS:
         return {
             "tool": None,
-            "answer": parsed.get(
-                "answer",
-                "Я могу помочь с отзывами: показать список, найти, добавить, статистику или черновик ответа.",
-            ),
+            "answer": "Не удалось выбрать инструмент для запроса. Попробуйте другой запрос.",
         }
 
-    if tool not in VALID_TOOLS:
+    arguments = parsed.get("arguments")
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
         return {
             "tool": None,
-            "answer": f"Неизвестный инструмент «{tool}». Попробуйте другой запрос.",
+            "answer": "Не удалось разобрать аргументы. Попробуйте переформулировать запрос.",
         }
 
-    return {
-        "tool": tool,
-        "arguments": parsed.get("arguments", {}),
-    }
+    # Argument types and ranges are enforced by the MCP server, not here.
+    return {"tool": tool, "arguments": arguments}
